@@ -12,6 +12,8 @@ import com.comet.opik.api.ProjectStats;
 import com.comet.opik.api.filter.DatasetItemFilter;
 import com.comet.opik.api.filter.ExperimentsComparisonFilter;
 import com.comet.opik.api.filter.Filter;
+import com.comet.opik.api.sorting.Direction;
+import com.comet.opik.api.sorting.SortableFields;
 import com.comet.opik.api.sorting.SortingFactoryDatasets;
 import com.comet.opik.domain.experiments.aggregations.AggregatedExperimentCounts;
 import com.comet.opik.domain.experiments.aggregations.AggregationBranchCountsCriteria;
@@ -1117,7 +1119,21 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
                 AND id NOT IN (SELECT id FROM experiment_aggregated_scope_ids)
                 ORDER BY (workspace_id, dataset_id, id) DESC, last_updated_at DESC
                 LIMIT 1 BY id
-            ), experiment_items_scope AS (
+            )<if(push_top_limit_raw)>
+            , top_dataset_items_raw AS (
+                SELECT DISTINCT ei_top.dataset_item_id AS dataset_item_id
+                FROM (
+                    SELECT ei.id AS id, ei.dataset_item_id AS dataset_item_id
+                    FROM experiment_items ei
+                    WHERE ei.workspace_id = :workspace_id
+                    AND ei.experiment_id IN (SELECT id FROM experiments_resolved)
+                    <if(experiment_ids)>AND ei.experiment_id IN :experiment_ids<endif>
+                    ORDER BY (ei.workspace_id, ei.experiment_id, ei.dataset_item_id, ei.trace_id, ei.id) DESC, ei.last_updated_at DESC
+                    LIMIT 1 BY ei.id
+                ) AS ei_top
+                ORDER BY <if(top_sorting_raw)><top_sorting_raw><else>ei_top.dataset_item_id DESC<endif>
+                LIMIT :top_limit OFFSET :top_offset
+            )<endif>, experiment_items_scope AS (
             	SELECT
             	    ei.id AS id,
             	    ei.experiment_id AS experiment_id,
@@ -1140,6 +1156,7 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
             	    AND lookup_div.id = ei.dataset_item_id
             	WHERE ei.workspace_id = :workspace_id
             	<if(experiment_ids)>AND ei.experiment_id IN :experiment_ids<endif>
+            	<if(push_top_limit_raw)>AND ei.dataset_item_id IN (SELECT dataset_item_id FROM top_dataset_items_raw)<endif>
             	ORDER BY (ei.workspace_id, ei.experiment_id, ei.dataset_item_id, ei.trace_id, ei.id) DESC, ei.last_updated_at DESC
             	LIMIT 1 BY ei.id
             ), experiment_items_trace_scope AS (
@@ -1148,6 +1165,7 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
                 INNER JOIN experiments_resolved e ON e.id = ei.experiment_id
                 WHERE ei.workspace_id = :workspace_id
                 <if(experiment_ids)>AND ei.experiment_id IN :experiment_ids<endif>
+                <if(push_top_limit_raw)>AND ei.dataset_item_id IN (SELECT dataset_item_id FROM top_dataset_items_raw)<endif>
             ), experiment_item_aggr_trace_scope AS (
                 SELECT DISTINCT trace_id
                 FROM experiment_item_aggregates ei
@@ -1897,7 +1915,7 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
             ORDER BY u.id DESC
             <endif>
             LIMIT :limit
-            <if(!push_top_limit)>OFFSET :offset<endif>
+            <if(!push_top_limit && !push_top_limit_raw)>OFFSET :offset<endif>
             SETTINGS output_format_json_named_tuples_as_objects = 1
             ;
             """;
@@ -4576,11 +4594,15 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
     }
 
     /**
-     * Conditionally enables the push-top-limit optimization on the aggregated branch of the
-     * dataset items + experiment items query, returning whether it was applied so the caller
-     * can bind {@code top_limit}/{@code top_offset} parameters accordingly.
+     * Conditionally enables the push-top-limit optimization on the dataset items + experiment
+     * items query, returning whether it was applied so the caller can bind
+     * {@code top_limit}/{@code top_offset} parameters accordingly.
      *
-     * <p>The optimization wraps the result page in a {@code top_dataset_items} CTE that
+     * <p>There are two independent forms, one per branch; they are mutually exclusive because each
+     * requires its own branch to be the only one present.
+     *
+     * <p><b>Aggregated branch ({@code push_top_limit}).</b> It wraps the result page in a
+     * {@code top_dataset_items} CTE that
      * pre-resolves the page's {@code dataset_item_id}s, so the IN filter on
      * {@code dataset_item_id} can prune both the EIA outer scan and the
      * {@code dataset_items_aggr_resolved} dedup CTE via the existing minmax / bloom_filter
@@ -4606,10 +4628,33 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
      *         {@link SortingFactoryDatasets#supportsPushTopLimit}.</li>
      * </ul>
      *
-     * <p>Sets {@code push_top_limit}, {@code top_sorting}, and {@code push_top_needs_div}
-     * template variables as appropriate.
+     * <p><b>Raw branch ({@code push_top_limit_raw}).</b> Same idea, sourced from
+     * {@code experiment_items} instead of {@code experiment_item_aggregates}. It matters more here:
+     * without it the raw branch materialises the whole experiment on every page — it dedups every
+     * trace, aggregates every span, and only applies {@code LIMIT/OFFSET} after
+     * {@code GROUP BY u.id} over all items. The CTE's ids prune {@code experiment_items_scope} and,
+     * decisively, {@code experiment_items_trace_scope}, which is what bounds the {@code traces},
+     * {@code spans}, {@code feedback_scores} and {@code comments} reads.
      *
-     * @return {@code true} when the optimization was applied to the template, {@code false} otherwise.
+     * <p>Its guard is <b>stricter</b> than the aggregated one, and deliberately not the same test:
+     * <ul>
+     *     <li><b>No filters at all.</b> The aggregated Top-N CTE folds filters in before its
+     *         {@code LIMIT}. The raw one cannot do so cheaply — raw filters resolve through
+     *         {@code traces} / {@code feedback_scores} / {@code dataset_item_versions}, i.e. the
+     *         very scans being avoided. Taking the top N ids and filtering afterwards would drop
+     *         rows that belong on the page, so filters disable it outright.</li>
+     *     <li><b>Sorting only by {@code id}, or not at all.</b>
+     *         {@link SortingFactoryDatasets#supportsPushTopLimit} whitelists columns that exist on
+     *         {@code experiment_item_aggregates} (duration, cost, usage, feedback scores, input /
+     *         output / metadata); none of them exists on {@code experiment_items}, so that
+     *         whitelist cannot be reused here. {@code id} is the one field the raw CTE can order
+     *         by on its own, and it is the ordering key of the outer query.</li>
+     * </ul>
+     *
+     * <p>Sets {@code push_top_limit}, {@code top_sorting} and {@code push_top_needs_div}, or
+     * {@code push_top_limit_raw} and {@code top_sorting_raw}, as appropriate.
+     *
+     * @return {@code true} when either form was applied to the template, {@code false} otherwise.
      */
     private boolean applyPushTopLimit(ST template, DatasetItemSearchCriteria criteria,
             boolean hasAggregated, boolean hasRaw) {
@@ -4632,8 +4677,41 @@ class DatasetItemVersionDAOImpl implements DatasetItemVersionDAO {
                     template.add("push_top_needs_div", true);
                 }
             }
+            return true;
         }
-        return pushTopLimit;
+
+        boolean pushTopLimitRaw = hasRaw && !hasAggregated
+                && !hasSearch
+                && !hasFilters
+                && (!hasSortingFields || isRawPushableSorting(criteria.sortingFields()));
+
+        if (pushTopLimitRaw) {
+            template.add("push_top_limit_raw", true);
+            if (hasSortingFields) {
+                template.add("top_sorting_raw", "ei_top.dataset_item_id %s"
+                        .formatted(rawSortDirection(criteria.sortingFields().getFirst())));
+            }
+        }
+        return pushTopLimitRaw;
+    }
+
+    /**
+     * The raw Top-N CTE only sees {@code experiment_items}, whose sole outer-query-visible column is
+     * {@code dataset_item_id}. So a single sort on {@code id} is pushable and nothing else is.
+     */
+    private boolean isRawPushableSorting(List<com.comet.opik.api.sorting.SortingField> sortingFields) {
+        return sortingFields.size() == 1
+                && SortableFields.ID.equals(sortingFields.getFirst().field());
+    }
+
+    /**
+     * Mirrors {@code SortingQueryBuilder.getDirection}, which defaults a null direction to ASC — the
+     * CTE's ordering must match the outer {@code ORDER BY} exactly or the page is the wrong slice.
+     */
+    private String rawSortDirection(com.comet.opik.api.sorting.SortingField sortingField) {
+        return sortingField.direction() != null
+                ? sortingField.direction().name()
+                : Direction.ASC.name();
     }
 
     /**
